@@ -20,6 +20,11 @@ from pre_commit.util import cmd_output
 from pre_commit.util import cmd_output_b
 from pre_commit.util import win_exe
 
+try:
+    import uv  # Attempt to import uv for handling virtualenvs and installation
+except ImportError:
+    uv = None  # If uv is not present, fall back to normal method
+
 ENVIRONMENT_DIR = 'py_env'
 run_hook = lang_base.basic_run_hook
 
@@ -83,14 +88,6 @@ def _find_by_sys_executable() -> str | None:
             return exe
         return None
 
-    # On linux, I see these common sys.executables:
-    #
-    # system `python`: /usr/bin/python -> python2.7
-    # system `python2`: /usr/bin/python2 -> python2.7
-    # virtualenv v: v/bin/python (will not return from this loop)
-    # virtualenv v -ppython2: v/bin/python -> python2
-    # virtualenv v -ppython2.7: v/bin/python -> python2.7
-    # virtualenv v -ppypy: v/bin/python -> v/bin/pypy
     for path in (sys.executable, os.path.realpath(sys.executable)):
         exe = _norm(path)
         if exe:
@@ -100,12 +97,10 @@ def _find_by_sys_executable() -> str | None:
 
 @functools.lru_cache(maxsize=1)
 def get_default_version() -> str:  # pragma: no cover (platform dependent)
-    # First attempt from `sys.executable` (or the realpath)
     exe = _find_by_sys_executable()
     if exe:
         return exe
 
-    # Next try the `pythonX.X` executable
     exe = f'python{sys.version_info[0]}.{sys.version_info[1]}'
     if find_executable(exe):
         return exe
@@ -113,7 +108,6 @@ def get_default_version() -> str:  # pragma: no cover (platform dependent)
     if _find_by_py_launcher(exe):
         return exe
 
-    # We tried!
     return C.DEFAULT
 
 
@@ -132,22 +126,20 @@ def _sys_executable_matches(version: str) -> bool:
 
 
 def norm_version(version: str) -> str | None:
-    if version == C.DEFAULT:  # use virtualenv's default
+    if version == C.DEFAULT:
         return None
-    elif _sys_executable_matches(version):  # virtualenv defaults to our exe
+    elif _sys_executable_matches(version):
         return None
 
-    if sys.platform == 'win32':  # pragma: no cover (windows)
+    if sys.platform == 'win32':
         version_exec = _find_by_py_launcher(version)
         if version_exec:
             return version_exec
 
-        # Try looking up by name
         version_exec = find_executable(version)
         if version_exec and version_exec != version:
             return version_exec
 
-    # Otherwise assume it is a path
     return os.path.expanduser(version)
 
 
@@ -162,7 +154,6 @@ def health_check(prefix: Prefix, version: str) -> str | None:
     envdir = lang_base.environment_dir(prefix, ENVIRONMENT_DIR, version)
     pyvenv_cfg = os.path.join(envdir, 'pyvenv.cfg')
 
-    # created with "old" virtualenv
     if not os.path.exists(pyvenv_cfg):
         return 'pyvenv.cfg does not exist (old virtualenv?)'
 
@@ -173,7 +164,6 @@ def health_check(prefix: Prefix, version: str) -> str | None:
     if 'version_info' not in cfg:
         return "created virtualenv's pyvenv.cfg is missing `version_info`"
 
-    # always use uncached lookup here in case we replaced an unhealthy env
     virtualenv_version = _version_info.__wrapped__(py_exe)
     if virtualenv_version != cfg['version_info']:
         return (
@@ -182,7 +172,6 @@ def health_check(prefix: Prefix, version: str) -> str | None:
             f'- expected version: {cfg["version_info"]}\n'
         )
 
-    # made with an older version of virtualenv? skip `base-executable` check
     if 'base-executable' not in cfg:
         return None
 
@@ -203,12 +192,33 @@ def install_environment(
         additional_dependencies: Sequence[str],
 ) -> None:
     envdir = lang_base.environment_dir(prefix, ENVIRONMENT_DIR, version)
-    venv_cmd = [sys.executable, '-mvirtualenv', envdir]
     python = norm_version(version)
+    install_cmd = [sys.executable, '-mpip', 'install', '.', *additional_dependencies]
+
+    if uv:
+        create_venv_with_uv(envdir, python)
+        install_with_uv(install_cmd)
+    else:
+        run_sync_install(envdir, python, install_cmd, prefix, version)
+
+
+def create_venv_with_uv(envdir: str, python: str | None) -> None:
+    # Use uv to create the virtual environment
+    uv.venv.create(envdir, python=python)
+
+
+def install_with_uv(install_cmd: list) -> None:
+    # Use uv to install the dependencies
+    uv.pip.sync(install_cmd)
+
+
+def run_sync_install(envdir: str, python: str, install_cmd: list, prefix: Prefix, version: str) -> None:
+    # Fallback to normal installation method (using virtualenv and pip)
+    venv_cmd = [sys.executable, '-mvirtualenv', envdir]
     if python is not None:
         venv_cmd.extend(('-p', python))
-    install_cmd = ('python', '-mpip', 'install', '.', *additional_dependencies)
-
     cmd_output_b(*venv_cmd, cwd='/')
+    
+    # Install dependencies
     with in_env(prefix, version):
         lang_base.setup_cmd(prefix, install_cmd)
